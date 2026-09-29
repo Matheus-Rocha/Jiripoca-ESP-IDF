@@ -32,6 +32,7 @@ void app_main(void) {
     xInitEventGroup       = xEventGroupCreate();
     xNVSCounterEventGroup = xEventGroupCreate();
     xFormatEventGroup     = xEventGroupCreate();
+    xCamEventGroup        = xEventGroupCreate();
 
     /* Setup Tasks */
     xTaskCreatePinnedToCore(task_setup, "Setup", configMINIMAL_STACK_SIZE * 8, NULL, 10, NULL, 1);
@@ -47,6 +48,8 @@ void app_main(void) {
     xTaskCreatePinnedToCore(task_lora, "LORA", configMINIMAL_STACK_SIZE * 2, NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(task_adc, "ADC", configMINIMAL_STACK_SIZE * 2, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(task_nvs, "NVS", configMINIMAL_STACK_SIZE * 2, NULL, 1, NULL, 0);
+    // Lowest priority of the flight tasks: video must never delay acquisition or logging
+    xTaskCreatePinnedToCore(task_camera, "CAMERA", configMINIMAL_STACK_SIZE * 3, NULL, 2, NULL, 1);
 #if CONFIG_LOG_DEFAULT_LEVEL >= ESP_LOG_DEBUG
     xTaskCreatePinnedToCore(task_log, "LOG", configMINIMAL_STACK_SIZE * 2, NULL, 1, NULL, 0);
 #endif

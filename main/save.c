@@ -14,6 +14,9 @@ static const char *TAG_NVS = "NVS";
 #define LFS_MAX_FLASH   0.9 // Maximum percentage of flash to be used by littlefs
 #define FILENAME_LENGTH 32
 
+#define QUEUE_TIMEOUT_MS    100   // Queues stop being fed after LANDING/LANDED, loops must still see the flag
+#define CAM_UNMOUNT_WAIT_MS 60000 // Camera records until LANDED, after the SD log stops at LANDING
+
 void task_sd(void *pvParameters) {
     esp_err_t     err;
     sdmmc_card_t *card;
@@ -69,6 +72,8 @@ void task_sd(void *pvParameters) {
         goto format_device;
     }
 
+    xEventGroupSetBits(xCamEventGroup, CAM_EVT_SD_READY);
+
     /* Create log file */
     char log_name[FILENAME_LENGTH];
     snprintf(log_name, FILENAME_LENGTH, "%s/test%lu.bin", SD_MOUNT, file_counter_g.sd_files);
@@ -95,7 +100,7 @@ void task_sd(void *pvParameters) {
     while (true) {
         // ================================= REVISÃO =================================
         // Read data from queue
-        if (xQueueReceive(xSDQueue, &save_data, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(xSDQueue, &save_data, pdMS_TO_TICKS(QUEUE_TIMEOUT_MS)) == pdTRUE) {
             // If buffer is full, write to file
             if (buffer_offset + sizeof(save_t) > SD_BUFFER_SIZE) {
                 size_t w = fwrite(write_buffer, 1, SD_BUFFER_SIZE, f);
@@ -159,6 +164,10 @@ void task_sd(void *pvParameters) {
     ESP_LOGI(TAG_SD, "File closed");
 
 cleanup:
+    if (!(xEventGroupWaitBits(xCamEventGroup, CAM_EVT_DONE, pdFALSE, pdTRUE, pdMS_TO_TICKS(CAM_UNMOUNT_WAIT_MS)) &
+          CAM_EVT_DONE))
+        ESP_LOGW(TAG_SD, "Camera still recording, unmounting anyway");
+
     esp_vfs_fat_sdcard_unmount(SD_MOUNT, card);
     ESP_LOGI(TAG_SD, "Card unmounted");
 
@@ -167,6 +176,7 @@ cleanup:
 
 setup_error:
     ESP_LOGE(TAG_SD, "SD init failed: %s", esp_err_to_name(err));
+    xEventGroupSetBits(xCamEventGroup, CAM_EVT_SD_FAILED);
 
     if (sd_mounted) {
         esp_vfs_fat_sdcard_unmount(SD_MOUNT, card);
@@ -256,7 +266,7 @@ void task_lfs(void *pvParameters) {
     while (true) {
         _lfs_full = atomic_load_explicit(&lfs_full, memory_order_relaxed);
         // Read data from queue
-        if (xQueueReceive(xLittleFSQueue, &save_data, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(xLittleFSQueue, &save_data, pdMS_TO_TICKS(QUEUE_TIMEOUT_MS)) == pdTRUE) {
             // If buffer is full, write to file
             if (buffer_offset + sizeof(save_t) > LFS_BUFFER_SIZE) {
                 if (!_lfs_full) {

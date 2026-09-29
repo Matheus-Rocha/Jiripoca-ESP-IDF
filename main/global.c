@@ -34,6 +34,7 @@ portMUX_TYPE xADCMutex  = portMUX_INITIALIZER_UNLOCKED;
 EventGroupHandle_t xInitEventGroup       = NULL;
 EventGroupHandle_t xNVSCounterEventGroup = NULL;
 EventGroupHandle_t xFormatEventGroup     = NULL;
+EventGroupHandle_t xCamEventGroup        = NULL;
 
 /* TASK HANDLE */
 TaskHandle_t xTaskLora    = NULL;

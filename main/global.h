@@ -40,6 +40,7 @@ extern TaskHandle_t xTaskAcquire;
 extern EventGroupHandle_t xInitEventGroup;
 extern EventGroupHandle_t xNVSCounterEventGroup; // NVS counter synchronization
 extern EventGroupHandle_t xFormatEventGroup;     // LittleFS and SD format synchronization
+extern EventGroupHandle_t xCamEventGroup;        // SD availability and camera shutdown synchronization
 
 /* BUS HANDLE*/
 extern i2c_master_bus_handle_t bus_handle;
@@ -57,3 +58,4 @@ void task_lfs(void *pvParameters);
 void task_nvs(void *pvParameters);
 void task_lora(void *pvParameters);
 void task_buzzer_led(void *pvParameters);
+void task_camera(void *pvParameters);

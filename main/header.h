@@ -96,6 +96,15 @@
 #define SPI_HOST SPI2_HOST
 #define DMA_CHAN SPI_DMA_CH_AUTO
 
+/* CAMERA LINK (ESP32-P4-EYE, SPI slave on its J22 header) */
+#define CAM_SPI_HOST       SPI3_HOST
+#define CAM_SPI_SCLK       GPIO_NUM_11 // J22 pin 16 (P4 GPIO52)
+#define CAM_SPI_MOSI       GPIO_NUM_7  // J22 pin 15 (P4 GPIO53)
+#define CAM_SPI_MISO       GPIO_NUM_2  // J22 pin 17 (P4 GPIO51)
+#define CAM_SPI_CS         GPIO_NUM_1  // J22 pin 18 (P4 GPIO50)
+#define CAM_HANDSHAKE_GPIO GPIO_NUM_36 // J22 pin 13 (P4 GPIO54)
+#define CAM_SPI_FREQ_HZ    (10 * 1000 * 1000)
+
 #define I2C_SPEED 400000 // 400kHz, fast mode
 
 #define GPS_BAUDRATE 9600
@@ -152,6 +161,11 @@
 #define EVT_SD_DONE  BIT(0)
 #define EVT_LFS_DONE BIT(1)
 #define EVT_NVS_DONE BIT(2)
+
+/* CAMERA FLAGS */
+#define CAM_EVT_SD_READY  BIT(0)
+#define CAM_EVT_SD_FAILED BIT(1)
+#define CAM_EVT_DONE      BIT(2)
 
 #define THRESHOLD_MS 150 // Time threshold for state transitions in ms (e.g. boost to coast, deploy drogue, etc.)
 #define PREPARE_FOR_LANDING_S                                                                                          \

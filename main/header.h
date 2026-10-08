@@ -47,63 +47,52 @@
 #include "ra01s.h"
 #include "vqf_c.h"
 
-#define BUZZER_GPIO     GPIO_NUM_38
-#define LED_GPIO        GPIO_NUM_15
-#define ALED_GPIO       GPIO_NUM_6
-#define BUTTON_GPIO     GPIO_NUM_0
-#define VIN_ADC_UNIT    ADC_UNIT_1    // ADC1 +
-#define VIN_ADC_CHANNEL ADC_CHANNEL_4 // CH4 = GPIO05
-#define DROGUE_GPIO     GPIO_NUM_47
-#define MAIN_GPIO       GPIO_NUM_48
-#define RBF_GPIO        GPIO_NUM_4
-#define GPS_RX          GPIO_NUM_14
-#define GPS_TX          GPIO_NUM_21
-#define SS              GPIO_NUM_10
-#define I2C_SDA_IO      GPIO_NUM_8
-#define I2C_SCL_IO      GPIO_NUM_9
-#define GPS_UART_NUM    UART_NUM_1
-#define LORA_UART_NUM   UART_NUM_2
-
 #define HIGH 1
 #define LOW  0
 
-/* GPIO */
-#define SPI2_MISO     GPIO_NUM_8
-#define SPI2_CLK      GPIO_NUM_9
-#define SPI2_MOSI     GPIO_NUM_10
-#define MAIN_DEPLOY   GPIO_NUM_15
-#define MAIN_CHARGE   GPIO_NUM_16
-#define DROGUE_DEPLOY GPIO_NUM_18
-#define DROGUE_CHARGE GPIO_NUM_17
-#define BUZZER_GPIO   GPIO_NUM_21
+/*
+ * PINOUT (ESP32-P4)
+ * PROVISIONAL: mapped onto the ESP32-P4-EYE devkit so the firmware runs on the bench without touching
+ * the camera, SD card, USB or console pins. Pins marked J22 are reachable on the devkit header; the
+ * others reuse devkit features we don't use (LCD, knob) and are NOT physically accessible.
+ * Replace with the final board pinout.
+ */
 
-#define LORA_RESET GPIO_NUM_12
-#define LORA_BUSY  GPIO_NUM_13
-#define LORA_DIO1  GPIO_NUM_14
-#define LORA_CS    GPIO_NUM_20
-#define HX_CLK     GPIO_NUM_37
-#define HX_DOUT    GPIO_NUM_38
-#define SD_DATA0   GPIO_NUM_39
-#define SD_DATA1   GPIO_NUM_40
-#define SD_DATA3   GPIO_NUM_41
-#define SD_DATA2   GPIO_NUM_42
-#define SD_CLK     GPIO_NUM_43
-#define SD_CMD     GPIO_NUM_46
-#define SD_DET     GPIO_NUM_45
-#define SD_PWR     GPIO_NUM_46
+/* Flight I/O */
+#define DROGUE_GPIO GPIO_NUM_18 // provisional (devkit LCD CS)
+#define MAIN_GPIO   GPIO_NUM_19 // provisional (devkit LCD DC)
+#define RBF_GPIO    GPIO_NUM_47 // provisional (devkit knob B)
+#define BUTTON_GPIO GPIO_NUM_35 // devkit BOOT button, used for format mode
+#define LED_GPIO    GPIO_NUM_15 // provisional (devkit LCD RST)
+#define BUZZER_GPIO GPIO_NUM_16 // provisional (devkit LCD MOSI)
 
-/* SPI CONFIG */
-#define SPI_HOST SPI2_HOST
-#define DMA_CHAN SPI_DMA_CH_AUTO
+#define VIN_ADC_UNIT    ADC_UNIT_1
+#define VIN_ADC_CHANNEL ADC_CHANNEL_1 // ADC1 CH1 = GPIO17, provisional (devkit LCD CLK)
 
-/* CAMERA LINK (ESP32-P4-EYE, SPI slave on its J22 header) */
-#define CAM_SPI_HOST       SPI3_HOST
-#define CAM_SPI_SCLK       GPIO_NUM_11 // J22 pin 16 (P4 GPIO52)
-#define CAM_SPI_MOSI       GPIO_NUM_7  // J22 pin 15 (P4 GPIO53)
-#define CAM_SPI_MISO       GPIO_NUM_2  // J22 pin 17 (P4 GPIO51)
-#define CAM_SPI_CS         GPIO_NUM_1  // J22 pin 18 (P4 GPIO50)
-#define CAM_HANDSHAKE_GPIO GPIO_NUM_36 // J22 pin 13 (P4 GPIO54)
-#define CAM_SPI_FREQ_HZ    (10 * 1000 * 1000)
+/* I2C: BMP390 and ICM20948 share the camera bus (devkit I2C, also on J22 pins 10/12) */
+#define I2C_SDA_IO GPIO_NUM_14
+#define I2C_SCL_IO GPIO_NUM_13
+
+/* GPS */
+#define GPS_UART_NUM UART_NUM_1
+#define GPS_RX       GPIO_NUM_6  // J22 pin 9
+#define GPS_TX       GPIO_NUM_10 // J22 pin 5
+
+/* LoRa SX126x on SPI2 */
+#define SPI_HOST   SPI2_HOST
+#define DMA_CHAN   SPI_DMA_CH_AUTO
+#define SPI2_CLK   GPIO_NUM_52 // J22 pin 16
+#define SPI2_MOSI  GPIO_NUM_53 // J22 pin 15
+#define SPI2_MISO  GPIO_NUM_51 // J22 pin 17
+#define LORA_CS    GPIO_NUM_50 // J22 pin 18
+#define LORA_RESET GPIO_NUM_54 // J22 pin 13
+#define LORA_BUSY  GPIO_NUM_7  // J22 pin 8
+#define LORA_DIO1  GPIO_NUM_8  // J22 pin 7
+
+/* SD card: SDMMC slot 0 uses fixed IO MUX pins (GPIO39-44), IO powered by on-chip LDO 4 */
+#define SD_SLOT     SDMMC_HOST_SLOT_0
+#define SD_LDO_CHAN 4
+#define SD_PWR_EN_N GPIO_NUM_46 // P-MOS switch, low = card powered
 
 #define I2C_SPEED 400000 // 400kHz, fast mode
 
@@ -166,6 +155,7 @@
 #define CAM_EVT_SD_READY  BIT(0)
 #define CAM_EVT_SD_FAILED BIT(1)
 #define CAM_EVT_DONE      BIT(2)
+#define CAM_EVT_BUS_READY BIT(3)
 
 #define THRESHOLD_MS 150 // Time threshold for state transitions in ms (e.g. boost to coast, deploy drogue, etc.)
 #define PREPARE_FOR_LANDING_S                                                                                          \

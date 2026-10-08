@@ -2,7 +2,6 @@ build/
 sdkconfig.old
 dependencies.lock
 managed_components/
-camera_p4/sdkconfig
 
 .vscode/*
 .devcontainer

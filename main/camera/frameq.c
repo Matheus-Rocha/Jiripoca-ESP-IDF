@@ -4,7 +4,7 @@
 #include "driver/jpeg_encode.h"
 #include "esp_log.h"
 
-#include "cam_p4.h"
+#include "camera.h"
 
 static const char *TAG = "frameq";
 
@@ -26,7 +26,7 @@ esp_err_t frameq_init(void) {
     };
     for (int i = 0; i < CAM_QUEUE_FRAMES; i++) {
         size_t size   = 0;
-        slots[i].data = jpeg_alloc_encoder_mem(CAM_LINK_FRAME_MAX, &mem_cfg, &size);
+        slots[i].data = jpeg_alloc_encoder_mem(CAM_FRAME_MAX,&mem_cfg, &size);
         if (!slots[i].data) {
             ESP_LOGE(TAG, "No memory for frame slot %d", i);
             return ESP_ERR_NO_MEM;

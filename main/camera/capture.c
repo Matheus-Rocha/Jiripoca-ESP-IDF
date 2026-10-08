@@ -21,26 +21,23 @@
 #include "esp_video_init.h"
 #include "linux/videodev2.h"
 
-#include "cam_p4.h"
+#include "camera.h"
 
 static const char *TAG = "capture";
 
 /* ESP32-P4-EYE board wiring (from the Espressif BSP / schematic v2.3) */
-#define BOARD_I2C_PORT      I2C_NUM_1
-#define BOARD_I2C_SCL       GPIO_NUM_13
-#define BOARD_I2C_SDA       GPIO_NUM_14
-#define BOARD_SCCB_FREQ_HZ  100000
-#define BOARD_CAM_XCLK      GPIO_NUM_11
-#define BOARD_CAM_XCLK_HZ   24000000
-#define BOARD_PWR_CTRL      GPIO_NUM_12 // Camera LDO and 3V3_PERI rail
-#define BOARD_CAM_RESET     GPIO_NUM_26
-#define BOARD_C6_EN         GPIO_NUM_9  // Wi-Fi/BT module, kept off
-#define BOARD_SD_PWR_N      GPIO_NUM_46 // P-MOS switch, high = SD card unpowered
-#define BOARD_LCD_BL_N      GPIO_NUM_20 // P-MOS switch, high = backlight off
-#define BOARD_FLASHLIGHT    GPIO_NUM_23
+#define BOARD_SCCB_FREQ_HZ 100000
+#define BOARD_CAM_XCLK     GPIO_NUM_11
+#define BOARD_CAM_XCLK_HZ  24000000
+#define BOARD_PWR_CTRL     GPIO_NUM_12 // Camera LDO and 3V3_PERI rail (also powers the I2C pull-ups)
+#define BOARD_CAM_RESET    GPIO_NUM_26
+#define BOARD_C6_EN        GPIO_NUM_9  // Wi-Fi/BT module, kept off
+#define BOARD_LCD_BL_N     GPIO_NUM_20 // P-MOS switch, high = backlight off
+#define BOARD_FLASHLIGHT   GPIO_NUM_23
 
 #define CAM_BUF_NUM       3
-#define CAPTURE_PRIORITY  5
+#define CAPTURE_PRIORITY  3 // Below the sensor tasks (5) sharing core 1
+#define CAPTURE_CORE      1
 #define CAPTURE_STACK     4096
 #define STATS_INTERVAL_MS 5000
 
@@ -52,13 +49,12 @@ static size_t                scaled_size;
 static ppa_client_handle_t   ppa_srm;
 static jpeg_encoder_handle_t jpeg_enc;
 
-static void board_power_init(void) {
+void board_power_init(void) {
     const struct {
         gpio_num_t pin;
         int        level;
     } outputs[] = {
-        {BOARD_PWR_CTRL, 1}, {BOARD_CAM_RESET, 1},  {BOARD_C6_EN, 0},
-        {BOARD_SD_PWR_N, 1}, {BOARD_LCD_BL_N, 1}, {BOARD_FLASHLIGHT, 0},
+        {BOARD_PWR_CTRL, 1}, {BOARD_CAM_RESET, 1}, {BOARD_C6_EN, 0}, {BOARD_LCD_BL_N, 1}, {BOARD_FLASHLIGHT, 0},
     };
 
     for (size_t i = 0; i < sizeof(outputs) / sizeof(outputs[0]); i++) {
@@ -69,7 +65,7 @@ static void board_power_init(void) {
     vTaskDelay(pdMS_TO_TICKS(20)); // Sensor power-up before SCCB access
 }
 
-static esp_err_t camera_init(void) {
+static esp_err_t camera_init(i2c_master_bus_handle_t i2c) {
     esp_cam_sensor_xclk_handle_t xclk;
     esp_cam_sensor_xclk_config_t xclk_cfg = {
         .esp_clock_router_cfg =
@@ -80,17 +76,6 @@ static esp_err_t camera_init(void) {
     };
     ESP_RETURN_ON_ERROR(esp_cam_sensor_xclk_allocate(ESP_CAM_SENSOR_XCLK_ESP_CLOCK_ROUTER, &xclk), TAG, "xclk alloc");
     ESP_RETURN_ON_ERROR(esp_cam_sensor_xclk_start(xclk, &xclk_cfg), TAG, "xclk start");
-
-    i2c_master_bus_handle_t     i2c;
-    i2c_master_bus_config_t i2c_cfg = {
-        .i2c_port                     = BOARD_I2C_PORT,
-        .scl_io_num                   = BOARD_I2C_SCL,
-        .sda_io_num                   = BOARD_I2C_SDA,
-        .clk_source                   = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt            = 7,
-        .flags.enable_internal_pullup = false, // Board has external pull-ups
-    };
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_cfg, &i2c), TAG, "i2c bus");
 
     esp_video_init_csi_config_t csi_cfg = {
         .sccb_config =
@@ -238,12 +223,12 @@ static void capture_task(void *arg) {
         err = jpeg_encoder_process(jpeg_enc, &enc, scaled_buf, CAM_OUT_WIDTH * CAM_OUT_HEIGHT * 2, slot->data,
                                    slot->size, &len);
 
-        if (err != ESP_OK || len > CAM_LINK_FRAME_MAX) {
+        if (err != ESP_OK || len > CAM_FRAME_MAX) {
             quality = quality > CAM_JPEG_QUALITY_MIN + 10 ? quality - 10 : CAM_JPEG_QUALITY_MIN;
             continue;
         }
 
-        // Keep frames near the target size: the S3 link and SD budget depend on it
+        // Keep frames near the target size: the SD card is shared with the flight log
         if (len > CAM_JPEG_TARGET_BYTES && quality > CAM_JPEG_QUALITY_MIN)
             quality -= 2;
         else if (len < CAM_JPEG_TARGET_BYTES * 3 / 4 && quality < CAM_JPEG_QUALITY_MAX)
@@ -265,13 +250,13 @@ static void capture_task(void *arg) {
     }
 }
 
-esp_err_t capture_start(void) {
-    board_power_init();
+esp_err_t capture_start(i2c_master_bus_handle_t i2c_bus) {
     ESP_RETURN_ON_ERROR(frameq_init(), TAG, "frame queue");
-    ESP_RETURN_ON_ERROR(camera_init(), TAG, "camera");
+    ESP_RETURN_ON_ERROR(camera_init(i2c_bus), TAG, "camera");
     ESP_RETURN_ON_ERROR(processing_init(), TAG, "ppa/jpeg");
     ESP_RETURN_ON_ERROR(stream_open(), TAG, "stream");
 
-    BaseType_t ok = xTaskCreatePinnedToCore(capture_task, "capture", CAPTURE_STACK, NULL, CAPTURE_PRIORITY, NULL, 0);
+    BaseType_t ok =
+        xTaskCreatePinnedToCore(capture_task, "capture", CAPTURE_STACK, NULL, CAPTURE_PRIORITY, NULL, CAPTURE_CORE);
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }

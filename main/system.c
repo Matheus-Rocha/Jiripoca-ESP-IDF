@@ -1,5 +1,7 @@
 #include "global.h"
 
+#include "camera.h"
+
 static const char *TAG_SYS = "System";
 
 #define SETUP_TIMEOUT_MS 20000
@@ -7,6 +9,8 @@ static const char *TAG_SYS = "System";
 
 static esp_err_t setup_peripherals(void) {
     esp_err_t err = ESP_OK;
+
+    board_power_init();
 
     /* I2C bus configuration */
     i2c_master_bus_config_t bus_config = {
@@ -195,6 +199,7 @@ void task_setup(void *pvParameters) {
     if (err != ESP_OK) {
         goto setup_error;
     }
+    xEventGroupSetBits(xCamEventGroup, CAM_EVT_BUS_READY);
 
     ESP_LOGI(TAG_SYS, "NVS flash init");
     err = setup_nvs(FORMAT_MODE);

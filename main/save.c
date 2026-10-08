@@ -1,5 +1,7 @@
 #include "global.h"
 
+#include <sd_pwr_ctrl_by_on_chip_ldo.h>
+
 static const char *TAG_SD  = "SD";
 static const char *TAG_LFS = "LittleFS";
 static const char *TAG_NVS = "NVS";
@@ -25,22 +27,29 @@ void task_sd(void *pvParameters) {
 
     ESP_LOGI(TAG_SD, "Initializing SD card");
 
-    /* SDIO host driver (4-bit mode enabled, max frequency set to 20MHz) */
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    /* Card power switch, then the on-chip LDO that supplies the SD IO pins */
+    gpio_reset_pin(SD_PWR_EN_N);
+    gpio_set_direction(SD_PWR_EN_N, GPIO_MODE_OUTPUT);
+    gpio_set_level(SD_PWR_EN_N, LOW);
 
-    /* SDIO slot config */
-    sdmmc_slot_config_t sd_cfg = {
-        .clk     = SD_CLK,
-        .cmd     = SD_CMD,
-        .d0      = SD_DATA0,
-        .d1      = SD_DATA1,
-        .d2      = SD_DATA2,
-        .d3      = SD_DATA3,
-        .cd      = GPIO_NUM_NC,
-        .gpio_wp = GPIO_NUM_NC,
-        .width   = 4, // 4-bit mode
-        .flags   = SDMMC_SLOT_FLAG_INTERNAL_PULLUP,
-    };
+    sd_pwr_ctrl_handle_t     sd_pwr  = NULL;
+    sd_pwr_ctrl_ldo_config_t ldo_cfg = {.ldo_chan_id = SD_LDO_CHAN};
+    err                              = sd_pwr_ctrl_new_on_chip_ldo(&ldo_cfg, &sd_pwr);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_SD, "SD IO power (LDO %d) failed", SD_LDO_CHAN);
+        goto setup_error;
+    }
+
+    /* SDMMC host, 4-bit at 40 MHz: the camera shares this card with the flight log */
+    sdmmc_host_t host    = SDMMC_HOST_DEFAULT();
+    host.slot            = SD_SLOT;
+    host.max_freq_khz    = SDMMC_FREQ_HIGHSPEED;
+    host.pwr_ctrl_handle = sd_pwr;
+
+    /* Slot 0 pins are fixed by the IO MUX; the board has external pull-ups */
+    sdmmc_slot_config_t sd_cfg = SDMMC_SLOT_CONFIG_DEFAULT();
+    sd_cfg.width               = 4;
+    sd_cfg.flags               = 0;
 
     /* Options for mounting file system */
     esp_vfs_fat_sdmmc_mount_config_t mount_cfg = {

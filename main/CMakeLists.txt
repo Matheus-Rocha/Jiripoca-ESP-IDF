@@ -8,7 +8,7 @@ list(APPEND REQUIRES esp_adc esp_ringbuf esp_timer esp_driver_i2c esp_driver_uar
                         nvs_flash sdmmc fatfs esp_bmp390 esp_littlefs-master
                         icm20948-master esp-idf-sx126x minmea-master vqf-main eskf
                         esp_driver_spi esp_driver_gpio esp_driver_sdmmc
-                        esp_driver_jpeg esp_driver_ppa esp_mm espressif__esp_video)
+                        esp_mm espressif__esp_video espressif__esp_h264)
 
 idf_component_register(
     SRCS ${SOURCES}

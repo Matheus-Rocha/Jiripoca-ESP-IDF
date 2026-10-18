@@ -9,13 +9,10 @@
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
-#include "driver/jpeg_encode.h"
-#include "driver/ppa.h"
 #include "esp_cam_sensor_xclk.h"
 #include "esp_check.h"
-#include "esp_heap_caps.h"
+#include "esp_h264_enc_single_hw.h"
 #include "esp_log.h"
-#include "esp_private/esp_cache_private.h"
 #include "esp_timer.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
@@ -28,7 +25,7 @@ static const char *TAG = "capture";
 /* ESP32-P4-EYE board wiring (from the Espressif BSP / schematic v2.3) */
 #define BOARD_SCCB_FREQ_HZ 100000
 #define BOARD_CAM_XCLK     GPIO_NUM_11
-#define BOARD_CAM_XCLK_HZ  24000000
+#define BOARD_CAM_XCLK_HZ  20000000    // SC035HGS 640x480 48 fps mode expects a 20 MHz input clock
 #define BOARD_PWR_CTRL     GPIO_NUM_12 // Camera LDO and 3V3_PERI rail (also powers the I2C pull-ups)
 #define BOARD_CAM_RESET    GPIO_NUM_26
 #define BOARD_C6_EN        GPIO_NUM_9  // Wi-Fi/BT module, kept off
@@ -41,13 +38,10 @@ static const char *TAG = "capture";
 #define CAPTURE_STACK     4096
 #define STATS_INTERVAL_MS 5000
 
-static int                   video_fd = -1;
-static uint8_t              *cam_buf[CAM_BUF_NUM];
-static uint32_t              cam_w, cam_h;
-static uint8_t              *scaled_buf;
-static size_t                scaled_size;
-static ppa_client_handle_t   ppa_srm;
-static jpeg_encoder_handle_t jpeg_enc;
+static int                            video_fd = -1;
+static uint8_t                       *cam_buf[CAM_BUF_NUM];
+static esp_h264_enc_handle_t          h264_enc;
+static esp_h264_enc_param_hw_handle_t h264_param;
 
 void board_power_init(void) {
     const struct {
@@ -100,23 +94,23 @@ static esp_err_t stream_open(void) {
         return ESP_FAIL;
     }
 
-    struct v4l2_format fmt = {.type = V4L2_BUF_TYPE_VIDEO_CAPTURE};
-    if (ioctl(video_fd, VIDIOC_G_FMT, &fmt) != 0)
-        return ESP_FAIL;
-
-    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB565;
+    // The ISP's YUV420 is the packed O_UYY_E_VYY layout the hardware H.264 encoder takes as input
+    struct v4l2_format fmt = {
+        .type                = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .fmt.pix.width       = CAM_WIDTH,
+        .fmt.pix.height      = CAM_HEIGHT,
+        .fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420,
+    };
     if (ioctl(video_fd, VIDIOC_S_FMT, &fmt) != 0) {
-        ESP_LOGE(TAG, "RGB565 not supported");
+        ESP_LOGE(TAG, "YUV420 %dx%d not supported by the sensor", CAM_WIDTH, CAM_HEIGHT);
         return ESP_FAIL;
     }
-    cam_w = fmt.fmt.pix.width;
-    cam_h = fmt.fmt.pix.height;
-    ESP_LOGI(TAG, "Sensor stream %lux%lu RGB565", cam_w, cam_h);
-
-    if (cam_w < CAM_CROP_WIDTH || cam_h < CAM_CROP_HEIGHT) {
-        ESP_LOGE(TAG, "Sensor frame smaller than the %dx%d crop", CAM_CROP_WIDTH, CAM_CROP_HEIGHT);
+    if (fmt.fmt.pix.width != CAM_WIDTH || fmt.fmt.pix.height != CAM_HEIGHT) {
+        ESP_LOGE(TAG, "Sensor gave %lux%lu, expected %dx%d", fmt.fmt.pix.width, fmt.fmt.pix.height, CAM_WIDTH,
+                 CAM_HEIGHT);
         return ESP_FAIL;
     }
+    ESP_LOGI(TAG, "Sensor stream %dx%d YUV420", CAM_WIDTH, CAM_HEIGHT);
 
     struct v4l2_requestbuffers req = {
         .count  = CAM_BUF_NUM,
@@ -143,48 +137,29 @@ static esp_err_t stream_open(void) {
     return ioctl(video_fd, VIDIOC_STREAMON, &type) == 0 ? ESP_OK : ESP_FAIL;
 }
 
-static esp_err_t processing_init(void) {
-    ppa_client_config_t ppa_cfg = {.oper_type = PPA_OPERATION_SRM};
-    ESP_RETURN_ON_ERROR(ppa_register_client(&ppa_cfg, &ppa_srm), TAG, "ppa");
-
-    jpeg_encode_engine_cfg_t jpeg_cfg = {.timeout_ms = 70};
-    ESP_RETURN_ON_ERROR(jpeg_new_encoder_engine(&jpeg_cfg, &jpeg_enc), TAG, "jpeg");
-
-    size_t align = 0;
-    ESP_RETURN_ON_ERROR(esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &align), TAG, "cache align");
-    scaled_size = (CAM_OUT_WIDTH * CAM_OUT_HEIGHT * 2 + align - 1) & ~(align - 1);
-    scaled_buf  = heap_caps_aligned_calloc(align, 1, scaled_size, MALLOC_CAP_SPIRAM);
-    return scaled_buf ? ESP_OK : ESP_ERR_NO_MEM;
-}
-
-static esp_err_t scale_frame(const uint8_t *src) {
-    ppa_srm_oper_config_t srm = {
-        .in.buffer         = src,
-        .in.pic_w          = cam_w,
-        .in.pic_h          = cam_h,
-        .in.block_w        = CAM_CROP_WIDTH,
-        .in.block_h        = CAM_CROP_HEIGHT,
-        .in.block_offset_x = (cam_w - CAM_CROP_WIDTH) / 2,
-        .in.block_offset_y = (cam_h - CAM_CROP_HEIGHT) / 2,
-        .in.srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
-        .out.buffer        = scaled_buf,
-        .out.buffer_size   = scaled_size,
-        .out.pic_w         = CAM_OUT_WIDTH,
-        .out.pic_h         = CAM_OUT_HEIGHT,
-        .out.srm_cm        = PPA_SRM_COLOR_MODE_RGB565,
-        .rotation_angle    = PPA_SRM_ROTATION_ANGLE_0,
-        .scale_x           = (float)CAM_OUT_WIDTH / CAM_CROP_WIDTH,
-        .scale_y           = (float)CAM_OUT_HEIGHT / CAM_CROP_HEIGHT,
-        .mode              = PPA_TRANS_MODE_BLOCKING,
+static esp_err_t encoder_init(void) {
+    esp_h264_enc_cfg_hw_t cfg = {
+        .pic_type = ESP_H264_RAW_FMT_O_UYY_E_VYY,
+        .gop      = CAM_H264_GOP,
+        .fps      = CAM_FPS,
+        .res      = {.width = CAM_WIDTH, .height = CAM_HEIGHT},
+        .rc       = {.bitrate = CAM_H264_BITRATE, .qp_min = CAM_H264_QP_MIN, .qp_max = CAM_H264_QP_MAX},
     };
-    return ppa_do_scale_rotate_mirror(ppa_srm, &srm);
+    if (esp_h264_enc_hw_new(&cfg, &h264_enc) != ESP_H264_ERR_OK ||
+        esp_h264_enc_hw_get_param_hd(h264_enc, &h264_param) != ESP_H264_ERR_OK ||
+        esp_h264_enc_open(h264_enc) != ESP_H264_ERR_OK) {
+        ESP_LOGE(TAG, "H.264 encoder init failed");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 static void capture_task(void *arg) {
-    uint32_t   quality    = CAM_JPEG_QUALITY_INIT;
     uint32_t   seq        = 0;
     uint32_t   encoded    = 0;
+    uint32_t   keyframes  = 0;
     uint64_t   bytes      = 0;
+    bool       resync     = false; // an encoded frame was lost: P-frames are useless until the next keyframe
     TickType_t last_stats = xTaskGetTickCount();
 
     while (true) {
@@ -198,52 +173,51 @@ static void capture_task(void *arg) {
             continue;
         }
 
-        uint32_t  capture_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        esp_err_t err        = ESP_FAIL;
-        if (buf.flags & V4L2_BUF_FLAG_DONE)
-            err = scale_frame(cam_buf[buf.index]);
+        uint32_t     capture_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        cam_frame_t *slot       = (buf.flags & V4L2_BUF_FLAG_DONE) ? frameq_acquire_write() : NULL;
 
-        // Give the buffer back before the slow part so the sensor never stalls
-        ioctl(video_fd, VIDIOC_QBUF, &buf);
-        if (err != ESP_OK)
-            continue;
-
-        cam_frame_t *slot = frameq_acquire_write();
-        if (!slot)
-            continue;
-
-        jpeg_encode_cfg_t enc = {
-            .width         = CAM_OUT_WIDTH,
-            .height        = CAM_OUT_HEIGHT,
-            .src_type      = JPEG_ENCODE_IN_FORMAT_RGB565,
-            .sub_sample    = JPEG_DOWN_SAMPLING_YUV420,
-            .image_quality = quality,
-        };
-        uint32_t len = 0;
-        err = jpeg_encoder_process(jpeg_enc, &enc, scaled_buf, CAM_OUT_WIDTH * CAM_OUT_HEIGHT * 2, slot->data,
-                                   slot->size, &len);
-
-        if (err != ESP_OK || len > CAM_FRAME_MAX) {
-            quality = quality > CAM_JPEG_QUALITY_MIN + 10 ? quality - 10 : CAM_JPEG_QUALITY_MIN;
+        // No slot: the frame is skipped before encoding, so the H.264 stream stays decodable
+        if (!slot) {
+            ioctl(video_fd, VIDIOC_QBUF, &buf);
             continue;
         }
 
-        // Keep frames near the target size: the SD card is shared with the flight log
-        if (len > CAM_JPEG_TARGET_BYTES && quality > CAM_JPEG_QUALITY_MIN)
-            quality -= 2;
-        else if (len < CAM_JPEG_TARGET_BYTES * 3 / 4 && quality < CAM_JPEG_QUALITY_MAX)
-            quality += 1;
+        esp_h264_enc_in_frame_t in = {
+            .raw_data = {.buffer = cam_buf[buf.index], .len = CAM_WIDTH * CAM_HEIGHT * 3 / 2},
+            .pts      = capture_ms,
+        };
+        esp_h264_enc_out_frame_t out = {
+            .raw_data = {.buffer = slot->data, .len = slot->size},
+        };
+        esp_h264_err_t err = esp_h264_enc_process(h264_enc, &in, &out);
 
-        frameq_commit(len, seq++, capture_ms);
+        // The encoder reads the camera buffer, so it is only returned after encoding
+        ioctl(video_fd, VIDIOC_QBUF, &buf);
+
+        if (err != ESP_H264_ERR_OK) {
+            ESP_LOGW(TAG, "H.264 frame lost (%d), forcing a keyframe", err);
+            esp_h264_enc_force_idr(&h264_param->base);
+            resync = true;
+            continue;
+        }
+
+        bool keyframe = out.frame_type == ESP_H264_FRAME_TYPE_IDR || out.frame_type == ESP_H264_FRAME_TYPE_I;
+        if (resync && !keyframe)
+            continue;
+        resync = false;
+
+        frameq_commit(out.length, seq++, capture_ms, keyframe);
         encoded++;
-        bytes += len;
+        keyframes += keyframe;
+        bytes += out.length;
 
         TickType_t now = xTaskGetTickCount();
         if (now - last_stats >= pdMS_TO_TICKS(STATS_INTERVAL_MS)) {
             float secs = (now - last_stats) * portTICK_PERIOD_MS / 1000.0f;
-            ESP_LOGI(TAG, "%.1f fps encoded, avg %lu B/frame, quality %lu, dropped %lu", encoded / secs,
-                     encoded ? (uint32_t)(bytes / encoded) : 0, quality, frameq_dropped());
+            ESP_LOGI(TAG, "%.1f fps encoded, %.0f kbit/s, %lu keyframes, dropped %lu", encoded / secs,
+                     bytes * 8 / 1000.0f / secs, keyframes, frameq_dropped());
             encoded    = 0;
+            keyframes  = 0;
             bytes      = 0;
             last_stats = now;
         }
@@ -253,7 +227,7 @@ static void capture_task(void *arg) {
 esp_err_t capture_start(i2c_master_bus_handle_t i2c_bus) {
     ESP_RETURN_ON_ERROR(frameq_init(), TAG, "frame queue");
     ESP_RETURN_ON_ERROR(camera_init(i2c_bus), TAG, "camera");
-    ESP_RETURN_ON_ERROR(processing_init(), TAG, "ppa/jpeg");
+    ESP_RETURN_ON_ERROR(encoder_init(), TAG, "h264");
     ESP_RETURN_ON_ERROR(stream_open(), TAG, "stream");
 
     BaseType_t ok =

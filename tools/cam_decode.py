@@ -1,10 +1,9 @@
-"""Converts a camN.mjp file recorded by the Jiripoca S3 into JPEG frames, a CSV index and an MP4.
+"""Converts a camN.vid file recorded by the Jiripoca camera into an H.264 stream, a CSV index and an MP4.
 
-Usage: python cam_decode.py cam12.mjp [output_dir]
+Usage: python cam_decode.py cam12.vid [output_dir]
 
-The MP4 needs ffmpeg on PATH; frame timing comes from the capture timestamps, so the video
-keeps real time even if the link dropped frames. capture_ms uses the same clock as the
-flight log "time" field (ms since S3 boot), which is how the video is synced with telemetry.
+The MP4 needs ffmpeg on PATH and is made without re-encoding. capture_ms in index.csv uses the same
+clock as the flight log "time" field (ms since boot), which is how the video is synced with telemetry.
 """
 
 import csv
@@ -14,10 +13,11 @@ import struct
 import subprocess
 import sys
 
-FILE_HDR = struct.Struct("<IHHI")  # magic, version, reserved, s3_open_ms
-REC_HDR = struct.Struct("<IIIII B3x")  # magic, seq, capture_ms, write_ms, len, status
+FILE_HDR = struct.Struct("<IHHI")  # magic, version, fps, open_ms
+REC_HDR = struct.Struct("<IIIIIBB2x")  # magic, seq, capture_ms, write_ms, len, status, keyframe
 FILE_MAGIC = 0x5649434A
 REC_MAGIC = 0x4D52464A
+FILE_VERSION = 2
 
 STATUS_BITS = ["INITIALIZED", "ARMED", "BOOST", "COAST", "DROGUE", "MAIN", "LANDING", "LANDED"]
 
@@ -25,7 +25,7 @@ STATUS_BITS = ["INITIALIZED", "ARMED", "BOOST", "COAST", "DROGUE", "MAIN", "LAND
 def read_records(data):
     pos = FILE_HDR.size
     while pos + REC_HDR.size <= len(data):
-        magic, seq, capture_ms, write_ms, length, status = REC_HDR.unpack_from(data, pos)
+        magic, seq, capture_ms, write_ms, length, status, keyframe = REC_HDR.unpack_from(data, pos)
         if magic != REC_MAGIC:
             # Resynchronize after a damaged record
             nxt = data.find(struct.pack("<I", REC_MAGIC), pos + 1)
@@ -34,11 +34,11 @@ def read_records(data):
             pos = nxt
             continue
         start = pos + REC_HDR.size
-        jpeg = data[start:start + length]
-        if len(jpeg) < length:
+        frame = data[start:start + length]
+        if len(frame) < length:
             print(f"Truncated last frame {seq} (power loss or impact), ignored")
             return
-        yield seq, capture_ms, write_ms, status, jpeg
+        yield seq, capture_ms, write_ms, status, bool(keyframe), frame
         pos = start + length
 
 
@@ -51,48 +51,47 @@ def main():
         sys.exit(__doc__)
 
     src = sys.argv[1]
-    out_dir = sys.argv[2] if len(sys.argv) > 2 else os.path.splitext(src)[0] + "_frames"
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else os.path.splitext(src)[0] + "_video"
     os.makedirs(out_dir, exist_ok=True)
 
     with open(src, "rb") as f:
         data = f.read()
 
-    magic, version, _, open_ms = FILE_HDR.unpack_from(data, 0)
+    magic, version, fps, open_ms = FILE_HDR.unpack_from(data, 0)
     if magic != FILE_MAGIC:
         sys.exit(f"{src} is not a Jiripoca camera file")
-    print(f"File version {version}, opened at {open_ms} ms after S3 boot")
+    if version != FILE_VERSION:
+        sys.exit(f"File version {version} not supported (this tool reads version {FILE_VERSION}, H.264)")
+    print(f"H.264 file, sensor {fps} fps, opened at {open_ms} ms after boot")
 
-    frames = []
-    with open(os.path.join(out_dir, "index.csv"), "w", newline="") as idx:
+    h264_path = os.path.join(out_dir, "video.h264")
+    times = []
+    keyframes = 0
+    with open(h264_path, "wb") as h264, open(os.path.join(out_dir, "index.csv"), "w", newline="") as idx:
         writer = csv.writer(idx)
-        writer.writerow(["file", "seq", "capture_ms", "write_ms", "bytes", "status"])
-        for seq, capture_ms, write_ms, status, jpeg in read_records(data):
-            name = f"frame_{len(frames):06d}.jpg"
-            with open(os.path.join(out_dir, name), "wb") as jf:
-                jf.write(jpeg)
-            writer.writerow([name, seq, capture_ms, write_ms, len(jpeg), status_names(status)])
-            frames.append((name, capture_ms))
+        writer.writerow(["frame", "seq", "capture_ms", "write_ms", "bytes", "keyframe", "status"])
+        for seq, capture_ms, write_ms, status, keyframe, frame in read_records(data):
+            if not times and not keyframe:
+                print("Warning: stream does not start on a keyframe, the first frames will not decode")
+            h264.write(frame)
+            writer.writerow([len(times), seq, capture_ms, write_ms, len(frame), int(keyframe), status_names(status)])
+            times.append(capture_ms)
+            keyframes += keyframe
 
-    if not frames:
+    if not times:
         sys.exit("No frames found")
 
-    span_s = (frames[-1][1] - frames[0][1]) / 1000
-    fps = (len(frames) - 1) / span_s if span_s > 0 else 0
-    print(f"{len(frames)} frames, {span_s:.1f} s, average {fps:.1f} fps -> {out_dir}")
+    span_s = (times[-1] - times[0]) / 1000
+    real_fps = (len(times) - 1) / span_s if span_s > 0 else fps
+    print(f"{len(times)} frames ({keyframes} keyframes), {span_s:.1f} s, average {real_fps:.1f} fps -> {out_dir}")
 
     if not shutil.which("ffmpeg"):
-        print("ffmpeg not found, skipping MP4 (frames and index.csv are ready)")
+        print("ffmpeg not found, skipping MP4 (video.h264 plays in VLC; index.csv has the timestamps)")
         return
 
-    list_path = os.path.join(out_dir, "frames.txt")
-    with open(list_path, "w") as lst:
-        for (name, t), (_, t_next) in zip(frames, frames[1:] + [(None, frames[-1][1] + 40)]):
-            lst.write(f"file '{name}'\nduration {max(t_next - t, 1) / 1000:.3f}\n")
-        lst.write(f"file '{frames[-1][0]}'\n")
-
     mp4 = os.path.join(out_dir, "video.mp4")
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", list_path,
-                    "-fps_mode", "vfr", "-pix_fmt", "yuv420p", mp4], check=True)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", f"{real_fps:.3f}", "-i", h264_path,
+                    "-c", "copy", mp4], check=True)
     print(f"Video: {mp4}")
 
 

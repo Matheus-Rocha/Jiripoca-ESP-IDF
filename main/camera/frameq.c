@@ -1,8 +1,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-#include "driver/jpeg_encode.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_private/esp_cache_private.h"
 
 #include "camera.h"
 
@@ -11,7 +12,7 @@ static const char *TAG = "frameq";
 static cam_frame_t       slots[CAM_QUEUE_FRAMES];
 static uint32_t          head, count;
 static bool              recording;
-static bool              head_in_tx; // link task is sending slots[head]
+static bool              head_in_tx; // recorder is writing slots[head]
 static uint32_t          dropped;
 static portMUX_TYPE      lock = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t ready_sem;
@@ -21,14 +22,17 @@ esp_err_t frameq_init(void) {
     if (!ready_sem)
         return ESP_ERR_NO_MEM;
 
-    jpeg_encode_memory_alloc_cfg_t mem_cfg = {
-        .buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER,
-    };
+    // The encoder writes the slots by DMA: they must be cache-line aligned
+    size_t align = 0;
+    esp_err_t err = esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &align);
+    if (err != ESP_OK)
+        return err;
+    size_t size = (CAM_FRAME_MAX + align - 1) & ~(align - 1);
+
     for (int i = 0; i < CAM_QUEUE_FRAMES; i++) {
-        size_t size   = 0;
-        slots[i].data = jpeg_alloc_encoder_mem(CAM_FRAME_MAX,&mem_cfg, &size);
+        slots[i].data = heap_caps_aligned_calloc(align, 1, size, MALLOC_CAP_SPIRAM);
         if (!slots[i].data) {
-            ESP_LOGE(TAG, "No memory for frame slot %d", i);
+            ESP_LOGE(TAG, "No PSRAM for frame slot %d", i);
             return ESP_ERR_NO_MEM;
         }
         slots[i].size = size;
@@ -42,33 +46,41 @@ void frameq_set_recording(bool rec) {
     portEXIT_CRITICAL(&lock);
 }
 
-// Returns the slot to encode into, or NULL if the frame must be dropped
+static void drop_head(void) {
+    head = (head + 1) % CAM_QUEUE_FRAMES;
+    count--;
+}
+
+// Returns the slot to encode into, or NULL if the frame must be skipped (it is then never encoded)
 cam_frame_t *frameq_acquire_write(void) {
     cam_frame_t *slot = NULL;
 
     portENTER_CRITICAL(&lock);
-    uint32_t limit = recording ? CAM_QUEUE_FRAMES : CAM_PRETRIGGER_FRAMES;
-    while (count >= limit && !head_in_tx) {
-        head = (head + 1) % CAM_QUEUE_FRAMES;
-        count--;
-        if (recording)
-            dropped++;
+    if (!recording && !head_in_tx) {
+        // Standby ring: forget the oldest frames, but the ring must always start on a keyframe
+        while (count >= CAM_PRETRIGGER_FRAMES)
+            drop_head();
+        while (count > 0 && !slots[head].keyframe)
+            drop_head();
     }
+
+    uint32_t limit = recording ? CAM_QUEUE_FRAMES : CAM_PRETRIGGER_FRAMES;
     if (count < limit)
         slot = &slots[(head + count) % CAM_QUEUE_FRAMES];
-    else
+    else if (recording)
         dropped++;
     portEXIT_CRITICAL(&lock);
 
     return slot;
 }
 
-void frameq_commit(uint32_t len, uint32_t seq, uint32_t capture_ms) {
+void frameq_commit(uint32_t len, uint32_t seq, uint32_t capture_ms, bool keyframe) {
     portENTER_CRITICAL(&lock);
     cam_frame_t *slot = &slots[(head + count) % CAM_QUEUE_FRAMES];
     slot->len         = len;
     slot->seq         = seq;
     slot->capture_ms  = capture_ms;
+    slot->keyframe    = keyframe;
     count++;
     portEXIT_CRITICAL(&lock);
 
@@ -90,10 +102,8 @@ cam_frame_t *frameq_peek(void) {
 
 void frameq_pop(void) {
     portENTER_CRITICAL(&lock);
-    if (count > 0) {
-        head = (head + 1) % CAM_QUEUE_FRAMES;
-        count--;
-    }
+    if (count > 0)
+        drop_head();
     head_in_tx = false;
     portEXIT_CRITICAL(&lock);
 }

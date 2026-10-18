@@ -20,7 +20,7 @@ static uint8_t cam_flight_status(void) {
 
 static FILE *cam_open_file(void) {
     char name[CAM_FILENAME_LENGTH];
-    snprintf(name, sizeof(name), "%s/cam%lu.mjp", CAM_MOUNT, file_counter_g.sd_files);
+    snprintf(name, sizeof(name), "%s/cam%lu.vid", CAM_MOUNT, file_counter_g.sd_files);
 
     FILE *f = fopen(name, "wb");
     if (!f) {
@@ -31,6 +31,7 @@ static FILE *cam_open_file(void) {
     cam_file_hdr_t hdr = {
         .magic   = CAM_FILE_MAGIC,
         .version = CAM_FILE_VERSION,
+        .fps     = CAM_FPS,
         .open_ms = (uint32_t)(esp_timer_get_time() / 1000),
     };
     fwrite(&hdr, 1, sizeof(hdr), f);
@@ -46,6 +47,7 @@ static bool cam_write_frame(FILE *f, const cam_frame_t *frame, uint8_t status) {
         .write_ms   = (uint32_t)(esp_timer_get_time() / 1000),
         .len        = frame->len,
         .status     = status,
+        .keyframe   = frame->keyframe,
     };
     return fwrite(&rec, 1, sizeof(rec), f) == sizeof(rec) && fwrite(frame->data, 1, frame->len, f) == frame->len;
 }
